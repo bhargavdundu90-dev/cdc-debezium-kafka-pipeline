@@ -26,6 +26,17 @@ flowchart LR
     CAT --> ATH[Athena<br/>point-in-time queries]
 ```
 
+## Generate sample change events (no database needed)
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python -m generator.cdc_events --snapshot 20 --changes 100 --duplicate-rate 0.05 --late-rate 0.05
+pytest -q
+```
+Each line is a Debezium-style envelope (`before`, `after`, `source.lsn`, `op` = r/c/u/d). The
+`--duplicate-rate` and `--late-rate` flags simulate Kafka's at-least-once delivery and out-of-order
+arrival, which the SCD2 job must handle. A seeded sample lives in `data/sample/customers_cdc.jsonl`.
+
 ## Planned repository layout
 ```
 generator/      synthetic Debezium-style change events (no database needed for tests)
@@ -39,7 +50,7 @@ tests/          pytest (local Spark, no AWS)
 
 ## Roadmap
 - [x] Repo skeleton, scenario and architecture
-- [ ] Synthetic CDC event generator
+- [x] Synthetic CDC event generator
 - [ ] Local infra (docker-compose: Postgres, Kafka, Debezium)
 - [ ] Ingestion to bronze
 - [ ] SCD2 merge transform
