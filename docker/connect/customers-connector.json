@@ -1,0 +1,20 @@
+{
+  "name": "bank-customers-cdc",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "plugin.name": "pgoutput",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "bank",
+    "database.password": "bank",
+    "database.dbname": "bank",
+    "topic.prefix": "bank",
+    "table.include.list": "public.customers",
+    "slot.name": "bank_customers_slot",
+    "publication.autocreate.mode": "filtered",
+    "snapshot.mode": "initial",
+    "tombstones.on.delete": "false",
+    "decimal.handling.mode": "string",
+    "time.precision.mode": "connect"
+  }
+}
