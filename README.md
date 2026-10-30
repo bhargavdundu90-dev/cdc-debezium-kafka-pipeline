@@ -8,7 +8,7 @@ merged into an **SCD Type 2** customer dimension with **PySpark**, queryable in 
 ## Business scenario
 A retail bank keeps customer master data (KYC status, risk tier, address, branch) in an OLTP Postgres database.
 Compliance and risk teams need to answer *"what was this customer's risk tier and KYC status on the day the loan
-was approved?"* — a point-in-time question that a nightly full snapshot cannot answer, because intra-day changes
+was approved?"*, a point-in-time question that a nightly full snapshot cannot answer, because intra-day changes
 are lost and history is overwritten.
 
 This project streams every insert/update/delete from Postgres as a change event and keeps a full,
@@ -59,4 +59,4 @@ tests/          pytest (local Spark, no AWS)
 - [ ] Unit + integration tests
 - [ ] Terraform
 - [ ] GitHub Actions CI
-- [ ] Design decisions, AWS mapping and interview Q&A
+- [ ] Design decisions, AWS mapping and FAQ
