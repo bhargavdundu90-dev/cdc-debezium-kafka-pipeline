@@ -31,7 +31,7 @@ flowchart LR
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python -m generator.cdc_events --snapshot 20 --changes 100 --duplicate-rate 0.05 --late-rate 0.05
-pytest -q
+pytest -q        # Spark tests need Java 11 or 17 on PATH
 ```
 Each line is a Debezium-style envelope (`before`, `after`, `source.lsn`, `op` = r/c/u/d). The
 `--duplicate-rate` and `--late-rate` flags simulate Kafka's at-least-once delivery and out-of-order
@@ -69,6 +69,36 @@ How the bronze writer behaves:
 - **At-least-once:** Kafka offsets are committed only after the batch is written.
 - **Deletes** are keyed from the `before` image, because `after` is null for `op=d`.
 
+## Build the SCD2 dimension (PySpark)
+```bash
+python -m transforms.scd2_merge --bronze data/output/bronze/customers_cdc --out data/output/silver/dim_customer_scd2
+```
+How [`transforms/scd2_merge.py`](transforms/scd2_merge.py) turns the raw change log into history:
+
+| Step | Why |
+|------|-----|
+| Take `after` for r/c/u and `before` for d | `after` is null on a delete, so the key and last values come from `before` |
+| Dedupe on `(customer_id, lsn)` | Kafka is at-least-once; the LSN is the identity of a change, so replays collapse |
+| Order by LSN inside each customer | arrival order and Kafka offset can be wrong after retries; LSN is commit order |
+| Drop no-op updates (row hash of tracked columns unchanged) | touching `updated_at` alone should not create a new version |
+| `valid_to = lead(change_ts)` over the customer window | a version lives until the next change for that customer |
+| Delete events close the open version and are then dropped | a deleted customer has history but no `is_current` row |
+
+Output columns: `customer_sk, customer_id, full_name, email, city, branch_code, risk_tier, kyc_status,
+updated_at, valid_from, valid_to (9999-12-31 for open rows), is_current, source_lsn, source_op, row_hash`.
+
+Point-in-time question from the scenario, once the table is in the Glue catalog:
+```sql
+SELECT d.customer_id, d.risk_tier, d.kyc_status
+FROM loans l
+JOIN dim_customer_scd2 d
+  ON d.customer_id = l.customer_id
+ AND l.approved_at >= d.valid_from
+ AND l.approved_at <  d.valid_to;
+```
+Right now the job rebuilds the dimension from all of bronze. That is simple and always correct while bronze
+is small; the incremental merge (only new events against the existing dimension) comes next.
+
 ## Repository layout
 ```
 generator/      synthetic Debezium-style change events (no database needed for tests)
@@ -85,7 +115,7 @@ tests/          pytest (local Spark, no AWS)
 - [x] Synthetic CDC event generator
 - [x] Local infra (docker-compose: Postgres, Kafka, Debezium)
 - [x] Ingestion to bronze
-- [ ] SCD2 merge transform
+- [x] SCD2 merge transform
 - [ ] Deletes, late / out-of-order events
 - [ ] Data-quality checks
 - [ ] Unit + integration tests
