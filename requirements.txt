@@ -1,5 +1,7 @@
 pytest>=8.0
 boto3>=1.34
 moto[s3]>=5.0
+# SCD2 transform and its tests (needs Java 11/17 on PATH)
+pyspark>=3.5,<4.0
 # only needed for --bootstrap (reading from a real Kafka broker)
 confluent-kafka>=2.4
