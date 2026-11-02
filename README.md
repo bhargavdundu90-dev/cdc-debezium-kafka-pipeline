@@ -85,7 +85,10 @@ How [`transforms/scd2_merge.py`](transforms/scd2_merge.py) turns the raw change 
 | Delete events close the open version and are then dropped | a deleted customer has history but no `is_current` row |
 
 Output columns: `customer_sk, customer_id, full_name, email, city, branch_code, risk_tier, kyc_status,
-updated_at, valid_from, valid_to (9999-12-31 for open rows), is_current, source_lsn, source_op, row_hash`.
+updated_at, valid_from, valid_to (9999-12-31 for open rows), is_current, source_lsn, source_op, closed_by_lsn,
+ended_by_delete, row_hash`. `closed_by_lsn` is the LSN of the change that ended a version, and `ended_by_delete`
+marks versions closed because the customer row was deleted (account closure), so analysts can tell a closed
+customer from a changed one.
 
 Point-in-time question from the scenario, once the table is in the Glue catalog:
 ```sql
@@ -96,8 +99,47 @@ JOIN dim_customer_scd2 d
  AND l.approved_at >= d.valid_from
  AND l.approved_at <  d.valid_to;
 ```
-Right now the job rebuilds the dimension from all of bronze. That is simple and always correct while bronze
-is small; the incremental merge (only new events against the existing dimension) comes next.
+The full rebuild reads all of bronze. That is simple and always correct, and it stays as the weekly
+reconciliation job; the daily job uses the incremental merge below.
+
+## Incremental merge (daily run)
+```bash
+python -m transforms.scd2_incremental --dim data/output/silver/dim_customer_scd2 \
+    --bronze data/output/bronze/customers_cdc --since 2026-10-02 \
+    --out data/output/silver/dim_customer_scd2_next
+```
+[`transforms/scd2_incremental.py`](transforms/scd2_incremental.py) reads only the new `event_date` partitions and
+rebuilds history for **just the customers those events touch**:
+
+```mermaid
+flowchart LR
+    NEW[new bronze partitions<br/>event_date >= since] --> N[normalize + dedupe]
+    N --> K[touched customer_ids]
+    DIM[(existing dim)] -->|left_anti| U[untouched rows<br/>copied as-is]
+    DIM -->|left_semi| A[touched customers' versions]
+    A --> L[back to a change log<br/>version = change at source_lsn<br/>ended_by_delete = 'd' at closed_by_lsn]
+    L --> M[union new events, dedupe on LSN,<br/>same build_scd2]
+    N --> M
+    M --> OUT[(next dim)]
+    U --> OUT
+```
+
+| Case | What happens |
+|------|--------------|
+| New update for a customer | current version gets `valid_to`, new version is current |
+| Late event (LSN between two existing versions) | slotted in by LSN; the earlier version is re-closed, later versions keep their values because Debezium sends full row images |
+| Same batch replayed after a failure | LSN dedupe makes the merge idempotent; output is unchanged |
+| Delete in today's batch | open version closed, `ended_by_delete = true`, no current row |
+| Delete yesterday, re-create today (same id) | two version chains with a gap between them; the new chain starts with `source_op = c` |
+| Late update that lands before an existing delete | inserted before the delete, the delete still closes the chain |
+
+The tests in `tests/test_scd2_incremental.py` compare the incremental result with a full rebuild over the same
+events, including a generated two-day stream with duplicates and out-of-order delivery.
+
+One known limit: no-op updates (only `updated_at` changed) are dropped and not kept in the dimension, so a late
+event that would turn one of them back into a real change cannot restore it. The weekly full rebuild from bronze
+fixes that case. The job also writes to a new path (`_next`) instead of overwriting the table it reads from;
+on S3 with Glue the swap is a catalog location update, and with Iceberg it becomes a `MERGE INTO`.
 
 ## Repository layout
 ```
@@ -116,7 +158,7 @@ tests/          pytest (local Spark, no AWS)
 - [x] Local infra (docker-compose: Postgres, Kafka, Debezium)
 - [x] Ingestion to bronze
 - [x] SCD2 merge transform
-- [ ] Deletes, late / out-of-order events
+- [x] Incremental merge: deletes, re-creates, late / out-of-order events
 - [ ] Data-quality checks
 - [ ] Unit + integration tests
 - [ ] Terraform
