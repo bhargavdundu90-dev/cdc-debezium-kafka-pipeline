@@ -8,11 +8,13 @@ Steps
   5. drop "no-op" updates where none of the tracked columns changed
   6. derive valid_from / valid_to with a window: a version is valid until the next change
      (an update or a delete) for the same customer
-  7. delete events close the open version and do not become a version themselves
+  7. delete events close the open version and do not become a version themselves;
+     `closed_by_lsn` / `ended_by_delete` record which change ended each version, so the
+     history can be turned back into a change log by the incremental merge
 
 This is a full rebuild from bronze, which is cheap at this size and always correct
-because bronze is the complete replayable log. Incremental merge against an existing
-dimension and late events after a run are handled separately.
+because bronze is the complete replayable log. For daily runs that only read new events,
+see transforms/scd2_incremental.py.
 
 Run locally:
     python -m transforms.scd2_merge --bronze data/output/bronze/customers_cdc --out data/output/silver/dim_customer_scd2
@@ -85,6 +87,8 @@ def build_scd2(changes: DataFrame) -> DataFrame:
     versions = (versions
                 .withColumn("valid_from", F.col("change_ts"))
                 .withColumn("valid_to", F.lead("change_ts").over(nxt))
+                .withColumn("closed_by_lsn", F.lead("lsn").over(nxt))
+                .withColumn("ended_by_delete", F.coalesce(F.lead("op").over(nxt) == "d", F.lit(False)))
                 .where(F.col("op") != "d"))  # a delete only closes the previous version
 
     return (versions
@@ -92,7 +96,8 @@ def build_scd2(changes: DataFrame) -> DataFrame:
             .withColumn("valid_to", F.coalesce(F.col("valid_to"), F.to_timestamp(F.lit(OPEN_END))))
             .withColumn("customer_sk", F.sha2(F.concat_ws(":", "customer_id", "lsn"), 256).substr(1, 16))
             .select("customer_sk", *ROW_FIELDS, "valid_from", "valid_to", "is_current",
-                    F.col("lsn").alias("source_lsn"), F.col("op").alias("source_op"), "row_hash"))
+                    F.col("lsn").alias("source_lsn"), F.col("op").alias("source_op"),
+                    "closed_by_lsn", "ended_by_delete", "row_hash"))
 
 
 def run(spark: SparkSession, bronze_path: str, out_path: str | None = None) -> DataFrame:
