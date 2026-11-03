@@ -141,6 +141,37 @@ event that would turn one of them back into a real change cannot restore it. The
 fixes that case. The job also writes to a new path (`_next`) instead of overwriting the table it reads from;
 on S3 with Glue the swap is a catalog location update, and with Iceberg it becomes a `MERGE INTO`.
 
+## Data-quality checks on the dimension
+```bash
+python -m quality.dim_checks --dim data/output/silver/dim_customer_scd2_next \
+    --bronze data/output/bronze/customers_cdc --report data/output/dq_report.json
+```
+A merge can finish without errors and still give wrong point-in-time answers, so
+[`quality/dim_checks.py`](quality/dim_checks.py) runs after every build and **before** the new table location is
+swapped in. An `error` check failing makes the script exit with code 1, so the orchestrator stops and the old
+version of the table stays live; a `warn` is published and reported.
+
+| Check | Severity | Catches |
+|-------|----------|---------|
+| `not_null_keys` | error | missing customer_id, source_lsn or valid_from |
+| `unique_customer_sk` | error | the same customer + LSN written twice |
+| `one_current_per_customer` | error | two `is_current` rows for one customer (a point-in-time join would double loans) |
+| `valid_window` | error | `valid_from >= valid_to` |
+| `current_flag_matches_end` | error | `is_current` disagreeing with the 9999-12-31 open end |
+| `no_overlap` | error | next version starting before the previous one ends |
+| `no_gap_without_delete` | warn | a hole in the history that no delete explains |
+| `deleted_not_current` | error | a closed account still marked current |
+| `accepted_values` | warn | risk_tier / kyc_status outside the known codes |
+| `reconcile_with_source` | error | current rows vs the latest non-deleted change per customer in bronze |
+
+`reconcile_with_source` compares a hash of the business columns rather than the LSN, because a trailing no-op
+update is the newest LSN in the source but correctly never becomes a version. It labels each mismatch as
+`missing_in_dim`, `not_live_in_source` or `stale_values`. The report (`dq_report.json`) keeps up to five sample
+keys per failed check, which is usually enough to start debugging without re-running Spark.
+
+The dimension is cached once before the checks because every check scans it; on the real table that is
+the difference between ten reads of S3 and one.
+
 ## Repository layout
 ```
 generator/      synthetic Debezium-style change events (no database needed for tests)
@@ -159,7 +190,7 @@ tests/          pytest (local Spark, no AWS)
 - [x] Ingestion to bronze
 - [x] SCD2 merge transform
 - [x] Incremental merge: deletes, re-creates, late / out-of-order events
-- [ ] Data-quality checks
+- [x] Data-quality checks
 - [ ] Unit + integration tests
 - [ ] Terraform
 - [ ] GitHub Actions CI
