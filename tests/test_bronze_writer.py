@@ -95,3 +95,103 @@ def test_s3_sink_writes_under_prefix():
     keys = [o["Key"] for o in s3.list_objects_v2(Bucket="bank-lake")["Contents"]]
     assert res.written == 4
     assert all(k.startswith("bronze/customers_cdc/event_date=") for k in keys)
+
+
+# --- edge cases -------------------------------------------------------------
+
+def test_kafka_bytes_values_are_accepted(tmp_path):
+    events = generate_events(n_snapshot=3, n_changes=0)
+    recs = [Record(TOPIC, 0, i, json.dumps(e).encode("utf-8")) for i, e in enumerate(events)]
+    res = write_batch(recs, LocalSink(tmp_path))
+    assert (res.written, res.rejected) == (3, 0)
+
+
+def test_rejected_bytes_value_is_kept_as_text(tmp_path):
+    res = write_batch([Record(TOPIC, 0, 7, b"{broken")], LocalSink(tmp_path))
+    assert (res.written, res.rejected) == (0, 1)
+    [f] = (tmp_path / "_rejected/customers_cdc").glob("*.jsonl")
+    assert f.name == f"part-{TOPIC}-0-000000000007.jsonl"
+    assert json.loads(f.read_text())["raw"] == "{broken"
+
+
+def test_null_value_tombstone_is_rejected():
+    # Debezium sends a null-value tombstone after each delete for log compaction
+    res = write_batch([Record(TOPIC, 0, 0, None)], _NullSink())
+    assert (res.written, res.rejected) == (0, 1)
+
+
+def test_one_file_per_event_date_and_partition(tmp_path):
+    day1 = ev_at(1, 100, "2026-10-01T23:59:00")
+    day2 = ev_at(2, 108, "2026-10-02T00:01:00")
+    recs = [Record(TOPIC, 0, 10, json.dumps(day1)), Record(TOPIC, 0, 11, json.dumps(day2)),
+            Record(TOPIC, 1, 5, json.dumps(day1))]
+    res = write_batch(recs, LocalSink(tmp_path))
+    names = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*.jsonl"))
+    assert names == [
+        f"customers_cdc/event_date=2026-10-01/part-{TOPIC}-0-000000000010.jsonl",
+        f"customers_cdc/event_date=2026-10-01/part-{TOPIC}-1-000000000005.jsonl",
+        f"customers_cdc/event_date=2026-10-02/part-{TOPIC}-0-000000000011.jsonl",
+    ]
+    assert res.written == 3
+
+
+def test_event_date_comes_from_commit_time_in_utc(tmp_path):
+    # 23:30 UTC is already the next day in IST; partitions follow UTC, like the Spark session
+    write_batch([Record(TOPIC, 0, 0, json.dumps(ev_at(1, 100, "2026-10-01T23:30:00")))], LocalSink(tmp_path))
+    assert [p.name for p in (tmp_path / "customers_cdc").iterdir()] == ["event_date=2026-10-01"]
+
+
+def test_offsets_committed_only_after_each_batch_is_written(tmp_path):
+    log = []
+    events = generate_events(n_snapshot=6, n_changes=0)
+    source = _ListSource([_records(events[:3]), _records(events[3:], start=3)], log)
+    run(source, _LoggingSink(LocalSink(tmp_path), log))
+    assert log == ["write", "commit", "write", "commit"]
+
+
+def test_no_commit_when_the_write_fails():
+    log = []
+    source = _ListSource([_records(generate_events(n_snapshot=2, n_changes=0))], log)
+    with pytest.raises(OSError):
+        run(source, _FailingSink())
+    assert "commit" not in log  # batch is re-read after restart instead of being lost
+
+
+# --- helpers ----------------------------------------------------------------
+
+def ev_at(cid, lsn, iso_utc):
+    from datetime import datetime, timezone
+    ts = int(datetime.fromisoformat(iso_utc).replace(tzinfo=timezone.utc).timestamp() * 1000)
+    row = {"customer_id": cid, "full_name": f"Customer {cid}"}
+    return {"before": None, "after": row, "op": "c", "ts_ms": ts,
+            "source": {"lsn": lsn, "ts_ms": ts}}
+
+
+class _ListSource:
+    def __init__(self, batches, log):
+        self._batches, self.log = batches, log
+
+    def batches(self, batch_size=500):
+        yield from self._batches
+
+    def commit(self):
+        self.log.append("commit")
+
+
+class _LoggingSink:
+    def __init__(self, inner, log):
+        self.inner, self.log = inner, log
+
+    def write(self, key, body):
+        self.log.append("write")
+        return self.inner.write(key, body)
+
+
+class _FailingSink:
+    def write(self, key, body):
+        raise OSError("disk full")
+
+
+class _NullSink:
+    def write(self, key, body):
+        return key

@@ -56,3 +56,36 @@ def test_cli_writes_jsonl(tmp_path):
     lines = out.read_text().splitlines()
     assert len(lines) == 8
     assert json.loads(lines[0])["op"] == "r"
+
+
+def test_no_deletes_when_delete_rate_is_zero():
+    assert all(e["op"] != "d" for e in generate_events(n_changes=300, seed=6, delete_rate=0.0))
+
+
+def test_commit_time_never_goes_backwards_in_lsn_order():
+    events = generate_events(n_changes=200, seed=7)
+    ts = [e["source"]["ts_ms"] for e in events]
+    assert ts == sorted(ts)
+    assert all(e["ts_ms"] == e["source"]["ts_ms"] for e in events)
+
+
+def test_inserts_use_new_ids_and_updates_stamp_updated_at():
+    events = generate_events(n_snapshot=5, n_changes=200, seed=8)
+    seen = set()
+    for e in events:
+        if e["op"] in ("r", "c"):
+            cid = e["after"]["customer_id"]
+            assert cid not in seen
+            seen.add(cid)
+        if e["op"] == "u":
+            assert e["after"]["updated_at"] != e["before"]["updated_at"]
+    created = [e["after"]["customer_id"] for e in events if e["op"] == "c"]
+    assert created == list(range(6, 6 + len(created)))
+
+
+def test_city_and_branch_stay_consistent():
+    from generator.cdc_events import BRANCHES, CITIES
+    pairs = dict(zip(CITIES, BRANCHES))
+    for e in generate_events(n_changes=300, seed=9):
+        row = e["after"] or e["before"]
+        assert pairs[row["city"]] == row["branch_code"]
