@@ -172,6 +172,54 @@ keys per failed check, which is usually enough to start debugging without re-run
 The dimension is cached once before the checks because every check scans it; on the real table that is
 the difference between ten reads of S3 and one.
 
+## Daily run: build, check, promote
+```bash
+python -m generator.cdc_events --snapshot 20 --changes 250 --duplicate-rate 0.05 --out data/output/in/all.jsonl
+python -m pipeline.split_days data/output/in/all.jsonl data/output/in        # one input file per day
+python -m pipeline.daily_run --input data/output/in/2026-10-01.jsonl --run-id 2026-10-01
+python -m pipeline.daily_run --input data/output/in/2026-10-02.jsonl --run-id 2026-10-02 \
+    --start-offset $(wc -l < data/output/in/2026-10-01.jsonl)
+```
+[`pipeline/daily_run.py`](pipeline/daily_run.py) is what the orchestrator calls once a day:
+
+```mermaid
+flowchart LR
+    IN[new change events] --> B[land in bronze<br/>returns event_date partitions written]
+    B --> Q{live version?}
+    Q -->|no| F[full build]
+    Q -->|yes| I[incremental merge<br/>since = oldest partition landed]
+    F --> V[(v=run_id)]
+    I --> V
+    V --> DQ[DQ checks<br/>report in _dq/run_id.json]
+    DQ -->|PASS| P[promote: _CURRENT -> v=run_id]
+    DQ -->|FAIL| K[keep yesterday's version live]
+```
+
+- Every run writes a new folder `v=<run_id>` and never overwrites one, so yesterday's version is there for rollback.
+- `_CURRENT` plays the part of the Glue table location. On AWS, promote is an `UpdateTable` that points the
+  table at the new S3 prefix (or an Iceberg commit), so Athena users switch over in one step.
+- **Why `since` is not the run date:** a late event is partitioned by the day it happened. If day two's batch
+  carries changes committed late on day one, they land in `event_date=2026-10-01`; starting the merge at
+  `2026-10-02` would silently skip them. The bronze writer returns the partitions it wrote and the merge starts
+  at the oldest one. Re-reading events already in the dimension is safe because of the LSN dedupe.
+- A run where every event was rejected skips the build and keeps the live table (`NO_DATA`).
+- Local replays continue Kafka offsets with `--start-offset`. Bronze file names use the first offset of a
+  batch, and two files both starting at offset 0 would overwrite each other in a shared partition.
+
+## Tests
+```bash
+pytest -q                        # everything (local Spark, no AWS)
+pytest -q -m "not integration"   # skip the end-to-end runs
+```
+| File | Covers |
+|------|--------|
+| `test_cdc_events.py` | envelope shape per op, LSN/timestamp order, ids, injected duplicates and late events |
+| `test_bronze_writer.py` | validation, rejects, bytes and tombstones, file naming per date/partition, UTC dates, commit only after write, offset continuation, S3 via moto |
+| `test_scd2_merge.py` | full build: dedupe, ordering, no-ops, deletes |
+| `test_scd2_incremental.py` | late events, replays, delete/re-create, parity with full rebuild |
+| `test_dim_checks.py` | each DQ check catches its broken case; CLI exit code |
+| `test_daily_run.py` (integration) | two daily runs through files on disk match a full rebuild, same-day retry is idempotent, failed DQ keeps the old version live, bad-only input skips the build |
+
 ## Repository layout
 ```
 generator/      synthetic Debezium-style change events (no database needed for tests)
@@ -179,6 +227,7 @@ docker/         docker-compose: Postgres + Kafka + Kafka Connect/Debezium
 ingestion/      Kafka / file -> bronze landing (local or S3)
 transforms/     bronze -> SCD2 silver (PySpark)
 quality/        data-quality checks on the dimension
+pipeline/       daily run: land -> build version -> DQ -> promote
 terraform/      S3, Glue, MSK/IAM mapping
 tests/          pytest (local Spark, no AWS)
 ```
@@ -191,7 +240,7 @@ tests/          pytest (local Spark, no AWS)
 - [x] SCD2 merge transform
 - [x] Incremental merge: deletes, re-creates, late / out-of-order events
 - [x] Data-quality checks
-- [ ] Unit + integration tests
+- [x] Unit + integration tests
 - [ ] Terraform
 - [ ] GitHub Actions CI
 - [ ] Design decisions, AWS mapping and FAQ
