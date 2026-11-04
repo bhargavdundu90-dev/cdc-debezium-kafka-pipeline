@@ -134,15 +134,22 @@ def write_batch(records: Iterable[Record], sink, ingested_at: str | None = None)
 
 
 class JsonlSource:
-    """Replay a generator file as if it came from one Kafka partition."""
+    """Replay a generator file as if it came from one Kafka partition.
 
-    def __init__(self, path, topic="bank.public.customers", partition=0):
+    `start_offset` continues the offset sequence from an earlier file. Bronze file names
+    use the first offset of a batch, so replaying a second day's file from offset 0 would
+    overwrite day one's files in any event_date partition both days write to (late events).
+    A real Kafka partition never reuses offsets, so this only matters for local replays.
+    """
+
+    def __init__(self, path, topic="bank.public.customers", partition=0, start_offset=0):
         self.path, self.topic, self.partition = Path(path), topic, partition
+        self.start_offset = start_offset
 
     def batches(self, batch_size=500) -> Iterator[list[Record]]:
         batch = []
         with self.path.open(encoding="utf-8") as fh:
-            for offset, line in enumerate(fh):
+            for offset, line in enumerate(fh, start=self.start_offset):
                 if not line.strip():
                     continue
                 batch.append(Record(self.topic, self.partition, offset, line))
@@ -180,6 +187,17 @@ class KafkaSource:  # pragma: no cover - needs a running broker
         self.consumer.commit(asynchronous=False)
 
 
+def event_dates(result: BatchResult) -> list[str]:
+    """event_date partitions a landing run wrote to (rejected files have none).
+
+    The daily merge reads from the oldest of these, not from the run's calendar date,
+    because a late event lands in the partition of the day it happened.
+    """
+    dates = {part.split("=", 1)[1] for f in result.files
+             for part in Path(f).parts if part.startswith("event_date=")}
+    return sorted(dates)
+
+
 def run(source, sink, batch_size=500) -> BatchResult:
     total = BatchResult(0, 0, [])
     for batch in source.batches(batch_size=batch_size):
@@ -201,9 +219,12 @@ def main(argv=None):
     p.add_argument("--s3-bucket", help="write to S3 instead of --out")
     p.add_argument("--s3-prefix", default="bronze")
     p.add_argument("--batch-size", type=int, default=500)
+    p.add_argument("--start-offset", type=int, default=0,
+                   help="with --from-file: first offset to assign (continue after an earlier file)")
     a = p.parse_args(argv)
 
-    source = JsonlSource(a.from_file, a.topic) if a.from_file else KafkaSource(a.bootstrap, a.topic)
+    source = (JsonlSource(a.from_file, a.topic, start_offset=a.start_offset) if a.from_file
+              else KafkaSource(a.bootstrap, a.topic))
     sink = S3Sink(a.s3_bucket, a.s3_prefix) if a.s3_bucket else LocalSink(a.out)
     res = run(source, sink, a.batch_size)
     print(f"bronze: {res.written} events written, {res.rejected} rejected, {len(res.files)} files")

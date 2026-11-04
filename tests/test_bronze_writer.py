@@ -195,3 +195,36 @@ class _FailingSink:
 class _NullSink:
     def write(self, key, body):
         return key
+
+
+# --- replaying several files locally ----------------------------------------
+
+def test_second_replay_file_continues_offsets_and_keeps_day_one_files(tmp_path):
+    from ingestion.bronze_writer import event_dates
+    day1 = [ev_at(1, 100, "2026-10-01T22:00:00"), ev_at(2, 108, "2026-10-01T23:00:00")]
+    late = [ev_at(3, 116, "2026-10-01T23:58:00"), ev_at(4, 124, "2026-10-02T08:00:00")]
+    f1 = write_jsonl(day1, tmp_path / "day1.jsonl")
+    f2 = write_jsonl(late, tmp_path / "day2.jsonl")
+    bronze = tmp_path / "bronze"
+
+    first = run(JsonlSource(f1), LocalSink(bronze))
+    second = run(JsonlSource(f2, start_offset=len(day1)), LocalSink(bronze))
+
+    assert len(_read_rows(bronze)) == 4  # day-one file in 2026-10-01 not overwritten by the late event
+    assert sorted(r["_kafka_offset"] for r in _read_rows(bronze)) == [0, 1, 2, 3]
+    assert event_dates(first) == ["2026-10-01"]
+    assert event_dates(second) == ["2026-10-01", "2026-10-02"]
+
+
+def test_event_dates_ignores_rejected_files(tmp_path):
+    from ingestion.bronze_writer import event_dates
+    res = write_batch([Record(TOPIC, 0, 0, "{bad"), Record(TOPIC, 0, 1, json.dumps(ev_at(1, 9, "2026-10-03T10:00:00")))],
+                      LocalSink(tmp_path))
+    assert res.rejected == 1 and event_dates(res) == ["2026-10-03"]
+
+
+def test_cli_start_offset(tmp_path):
+    from ingestion.bronze_writer import main
+    src = write_jsonl(generate_events(n_snapshot=3, n_changes=0), tmp_path / "in.jsonl")
+    main(["--from-file", str(src), "--out", str(tmp_path / "b"), "--start-offset", "100"])
+    assert sorted(r["_kafka_offset"] for r in _read_rows(tmp_path / "b")) == [100, 101, 102]
