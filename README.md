@@ -206,6 +206,55 @@ flowchart LR
 - Local replays continue Kafka offsets with `--start-offset`. Bronze file names use the first offset of a
   batch, and two files both starting at offset 0 would overwrite each other in a shared partition.
 
+## Deploy to AWS (Terraform)
+```bash
+./scripts/package_glue.sh                       # dist/cdc_pipeline.zip for the Glue job
+cd terraform
+cp terraform.tfvars.example terraform.tfvars    # region, alert email, MSK on/off
+terraform init && terraform plan -out tfplan && terraform apply tfplan
+```
+```mermaid
+flowchart LR
+    BW[bronze writer<br/>ECS task, IAM role:<br/>PutObject bronze/* only] --> B[(S3 lake bucket<br/>KMS, versioned<br/>bronze/ silver/ artifacts/)]
+    MSK[(MSK Serverless<br/>optional)] --> BW
+    T1[Glue trigger<br/>daily 07:00 IST] --> J[Glue job<br/>scd2-daily, 2 x G.1X]
+    T2[Glue trigger<br/>weekly --mode full] --> J
+    B --> J
+    J -->|v=run_id + _dq report| B
+    J -->|UpdateTable on PASS| C[Glue table<br/>dim_customer_scd2]
+    C --> A[Athena]
+    J -.->|FAILED / TIMEOUT| EB[EventBridge] --> SNS[SNS alert]
+```
+| File | What it creates |
+|------|-----------------|
+| `s3.tf` | one lake bucket (public access blocked, KMS key with rotation, versioning), lifecycle: rejected events expire after 30 days, bronze moves to Standard-IA after 30; Glue script and code zip uploaded from the repo |
+| `glue.tf` | Glue database, `dim_customer_scd2` table (Parquet, 17 columns), `bronze_customers_cdc` table with partition projection on `event_date`, the Glue job and two scheduled triggers |
+| `iam.tf` | Glue job role: read bronze and code, write only `silver/dim_customer_scd2/*`, `GetTable`/`UpdateTable` only in this database; bronze writer role: `PutObject` on `bronze/*` and MSK read on one topic and one consumer group |
+| `msk.tf` | MSK Serverless with IAM auth, behind `create_msk` (default off) |
+| `monitoring.tf` | EventBridge rule on Glue job state FAILED/TIMEOUT/STOPPED, SNS topic with optional email |
+
+How the Glue job differs from the local daily run ([`pipeline/glue_job.py`](pipeline/glue_job.py)):
+- **Promote is a catalog update.** [`pipeline/glue_catalog.py`](pipeline/glue_catalog.py) reads the table, drops the
+  read-only fields that `GetTable` returns and `UpdateTable` rejects, changes only the location and records
+  `cdc_live_version` / `cdc_previous_version` as table parameters. `rollback()` points the table back at the
+  previous version in one call.
+- **Terraform ignores the table location and parameters** (`lifecycle.ignore_changes`), otherwise the next
+  `terraform apply` would move the table back to the placeholder and undo the last promote.
+- **Lookback instead of "partitions this run landed".** Landing is continuous on AWS, so the job re-reads the last
+  `lookback_days` (default 2) `event_date` partitions. Later stragglers are picked up by the weekly `--mode full` run.
+- **`max_concurrent_runs = 1` and no automatic retry.** Two runs promoting at the same time would race on
+  `UpdateTable`; a failed run is looked at first, then re-run with the same run id (idempotent).
+- **Job bookmarks are off.** The job keeps its own state (live version on the table, LSN dedupe), and a bookmark
+  would hide the late-event partitions it needs to re-read.
+- **A failed DQ check fails the job** (exit code 1), which is what fires the alert; the table is not touched.
+
+The Glue job and catalog code are tested without AWS: `tests/test_glue_catalog.py` runs promote and rollback
+against moto, and `tests/test_glue_job.py` runs a full then incremental build under local Spark with the catalog
+in moto. `terraform validate` passes with `terraform init -backend=false`.
+
+Rough cost for the dev setup with MSK off: two G.1X workers for a few minutes a day is a few DPU-hours a month,
+plus S3 and one KMS key. MSK Serverless is the expensive piece, which is why it is opt-in.
+
 ## Tests
 ```bash
 pytest -q                        # everything (local Spark, no AWS)
@@ -218,6 +267,8 @@ pytest -q -m "not integration"   # skip the end-to-end runs
 | `test_scd2_merge.py` | full build: dedupe, ordering, no-ops, deletes |
 | `test_scd2_incremental.py` | late events, replays, delete/re-create, parity with full rebuild |
 | `test_dim_checks.py` | each DQ check catches its broken case; CLI exit code |
+| `test_glue_catalog.py` | Glue promote keeps schema and drops read-only fields, previous version recorded, rollback (moto) |
+| `test_glue_job.py` (integration) | Glue argument parsing, lookback window, full then incremental run promoting through the catalog |
 | `test_daily_run.py` (integration) | two daily runs through files on disk match a full rebuild, same-day retry is idempotent, failed DQ keeps the old version live, bad-only input skips the build |
 
 ## Repository layout
@@ -227,8 +278,10 @@ docker/         docker-compose: Postgres + Kafka + Kafka Connect/Debezium
 ingestion/      Kafka / file -> bronze landing (local or S3)
 transforms/     bronze -> SCD2 silver (PySpark)
 quality/        data-quality checks on the dimension
-pipeline/       daily run: land -> build version -> DQ -> promote
-terraform/      S3, Glue, MSK/IAM mapping
+pipeline/       daily run: land -> build version -> DQ -> promote; Glue job + Glue catalog promote
+glue/           script the Glue job runs
+scripts/        package_glue.sh (code zip for --extra-py-files)
+terraform/      S3 + KMS, Glue catalog/job/triggers, IAM, optional MSK, alerts
 tests/          pytest (local Spark, no AWS)
 ```
 
@@ -241,6 +294,6 @@ tests/          pytest (local Spark, no AWS)
 - [x] Incremental merge: deletes, re-creates, late / out-of-order events
 - [x] Data-quality checks
 - [x] Unit + integration tests
-- [ ] Terraform
+- [x] Terraform
 - [ ] GitHub Actions CI
 - [ ] Design decisions, AWS mapping and FAQ
