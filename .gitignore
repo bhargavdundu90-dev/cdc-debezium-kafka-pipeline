@@ -14,3 +14,4 @@ derby.log
 data/output/
 *.exe
 *.dll
+dist/
