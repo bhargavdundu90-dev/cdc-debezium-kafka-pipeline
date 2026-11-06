@@ -1,5 +1,7 @@
 # cdc-debezium-kafka-pipeline
 
+[![CI](https://github.com/bhargavdundu90-dev/cdc-debezium-kafka-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/bhargavdundu90-dev/cdc-debezium-kafka-pipeline/actions/workflows/ci.yml)
+
 Change data capture (CDC) from a Postgres core-banking database with **Debezium + Kafka**, landed on S3 and
 merged into an **SCD Type 2** customer dimension with **PySpark**, queryable in **Athena**.
 
@@ -255,6 +257,25 @@ in moto. `terraform validate` passes with `terraform init -backend=false`.
 Rough cost for the dev setup with MSK off: two G.1X workers for a few minutes a day is a few DPU-hours a month,
 plus S3 and one KMS key. MSK Serverless is the expensive piece, which is why it is opt-in.
 
+## CI (GitHub Actions)
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push to `main` and on pull requests:
+
+| Job | What it does |
+|-----|--------------|
+| `tests` | Python 3.10 (what Glue 4.0 runs) and 3.11, Temurin Java 17 for local Spark; unit tests, then the integration tests as a separate step, then a smoke run of two daily runs on freshly generated data that must end with `_CURRENT` pointing at day two. JUnit XML and the DQ reports are uploaded as artifacts |
+| `glue-package` | builds `dist/cdc_pipeline.zip` and fails if anything other than the four job packages ends up in it (no tests, no generator) |
+| `terraform` | `terraform fmt -check`, `init -backend=false`, `validate`; the Glue zip is built first because `s3.tf` hashes it |
+
+Choices worth knowing:
+- **No AWS credentials in CI.** S3 and the Glue catalog are mocked with moto, Spark runs `local[2]`. Nothing in
+  the pipeline needs a real account to be tested, so a fork's pull request can run the full suite safely.
+- **Unit and integration as separate steps.** A red unit step points at one function; a red integration step
+  with green units usually means two pieces disagree about a contract (paths, partition names, the promote pointer).
+- **`terraform plan` is not in CI.** It needs credentials and state; plan/apply belongs in a deploy workflow with
+  OIDC to an IAM role and a manual approval, not in the test pipeline.
+- `concurrency` cancels an older run on the same branch, and `SPARK_LOCAL_IP=127.0.0.1` avoids hostname
+  resolution problems on hosted runners.
+
 ## Tests
 ```bash
 pytest -q                        # everything (local Spark, no AWS)
@@ -283,6 +304,7 @@ glue/           script the Glue job runs
 scripts/        package_glue.sh (code zip for --extra-py-files)
 terraform/      S3 + KMS, Glue catalog/job/triggers, IAM, optional MSK, alerts
 tests/          pytest (local Spark, no AWS)
+.github/        CI: tests on Python 3.10/3.11, Glue package check, terraform validate
 ```
 
 ## Roadmap
@@ -295,5 +317,5 @@ tests/          pytest (local Spark, no AWS)
 - [x] Data-quality checks
 - [x] Unit + integration tests
 - [x] Terraform
-- [ ] GitHub Actions CI
+- [x] GitHub Actions CI
 - [ ] Design decisions, AWS mapping and FAQ
