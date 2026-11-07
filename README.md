@@ -276,6 +276,40 @@ Choices worth knowing:
 - `concurrency` cancels an older run on the same branch, and `SPARK_LOCAL_IP=127.0.0.1` avoids hostname
   resolution problems on hosted runners.
 
+## Design decisions
+| Decision | Chosen | Alternatives considered | Why |
+|----------|--------|-------------------------|-----|
+| Capture method | Debezium log-based CDC (`pgoutput`, logical replication slot) | `updated_at` polling, triggers into an audit table, nightly snapshot | polling misses deletes and every change between two polls; triggers add write cost to the OLTP database; the WAL already has every committed change in order |
+| Replica identity | `REPLICA IDENTITY FULL` on `customers` | default (primary key only) | deletes and updates then carry the full `before` image, so a delete can close a version without looking anything up |
+| Ordering key | Postgres LSN | Kafka offset, event timestamp, `updated_at` | the LSN is commit order in the source; offsets restart per partition and change on replay, timestamps can tie or drift |
+| Bronze format | raw envelopes as JSON lines, partitioned by `event_date`, duplicates kept | dedupe on landing, Parquet with a fixed schema | bronze is the replayable log; if the SCD2 logic has a bug, the dimension is rebuilt from bronze. Deduping early would make that impossible to verify |
+| Surrogate key | `sha2(customer_id:lsn)` truncated to 16 hex chars | sequence / `monotonically_increasing_id` | deterministic, so a rebuild or a replay produces the same keys and facts joined on them do not break |
+| Change detection | SHA-256 hash of the tracked business columns | compare every column, version on every event | an update that only touches `updated_at` does not create a new version, so history stays readable |
+| Daily processing | incremental merge for the customers touched since the oldest landed partition, weekly full rebuild | full rebuild every day, Iceberg `MERGE INTO` only | the daily job reads a few partitions instead of all of bronze; the weekly rebuild repairs the one case the incremental merge cannot (a late event next to a dropped no-op) |
+| Publishing | write a new `v=<run_id>` folder, DQ, then switch the Glue table location | overwrite the table in place | readers never see a half-written table, a failed check leaves yesterday live, rollback is one `UpdateTable` |
+| Table format | Parquet with catalog swap now, Iceberg as the next step | Iceberg from day one, Hudi | Parquet plus a location swap is easy to run and test locally; the merge logic does not change if the write becomes an Iceberg `MERGE INTO` |
+| Orchestration | Glue triggers (daily + weekly full), one concurrent run | Step Functions, MWAA | one job and two schedules do not need a separate orchestrator; Step Functions becomes worth it once other tables depend on this one |
+
+## Local vs AWS
+| Piece | Local / tests | AWS |
+|-------|---------------|-----|
+| Source database | Postgres 16 in docker-compose (`wal_level=logical`) | Amazon RDS / Aurora PostgreSQL with `rds.logical_replication=1` |
+| CDC connector | Debezium on Kafka Connect in docker | Debezium on MSK Connect (custom plugin), or DMS for a managed alternative |
+| Kafka | Kafka in KRaft mode | MSK Serverless with IAM auth (`msk.tf`, opt-in) |
+| Bronze writer | `python -m ingestion.bronze_writer` | same code as an ECS Fargate task with a role limited to `PutObject` on `bronze/*` |
+| Storage | `data/output/` folders, moto S3 in tests | S3 lake bucket, KMS encrypted, versioned, lifecycle on bronze |
+| Transform | PySpark `local[2]` | Glue 4.0 job (`glue/scd2_daily_job.py`), code shipped as `--extra-py-files` zip |
+| Live version pointer | `_CURRENT` file | Glue table location + `cdc_live_version` parameter |
+| Catalog | moto Glue | Glue Data Catalog, bronze table with partition projection |
+| Query | Spark SQL | Athena |
+| Scheduling | `pipeline.daily_run` by hand or cron | Glue triggers: daily 07:00 IST, weekly `--mode full` |
+| Alerts | exit code 1 | EventBridge rule on Glue job FAILED/TIMEOUT/STOPPED to SNS |
+
+Things to set on the real database before the connector starts: a dedicated replication user, a publication
+limited to the captured tables, and monitoring on the replication slot lag
+(`pg_replication_slots`, `confirmed_flush_lsn`). A slot whose consumer is down keeps WAL on disk, so a stopped
+connector on RDS ends with a full disk if nobody is alerted.
+
 ## Tests
 ```bash
 pytest -q                        # everything (local Spark, no AWS)
