@@ -310,6 +310,62 @@ limited to the captured tables, and monitoring on the replication slot lag
 (`pg_replication_slots`, `confirmed_flush_lsn`). A slot whose consumer is down keeps WAL on disk, so a stopped
 connector on RDS ends with a full disk if nobody is alerted.
 
+## Interview notes
+**1. Why log-based CDC instead of querying `updated_at` every few minutes?**
+Polling only sees the latest state at poll time. Two updates between polls become one, and a deleted row simply
+disappears, so the history needed for a point-in-time KYC question is lost. It also needs an index on
+`updated_at` and puts read load on the OLTP database. Debezium reads the WAL through a replication slot, so every
+committed insert, update and delete arrives once, in commit order, with the before and after images.
+
+**2. Kafka is at-least-once. How do you stop duplicates from creating extra versions?**
+Bronze keeps everything, duplicates included. The SCD2 job drops duplicates on `(customer_id, lsn)`, because the
+LSN identifies one committed change no matter how many times it was delivered. The surrogate key is a hash of the
+same pair, so even if a duplicate slipped through it would collide instead of adding a row, and the
+`unique_customer_sk` check would fail the run before promotion.
+
+**3. How are late and out-of-order events handled?**
+Order comes from the LSN, never from arrival time or the Kafka offset. A late event is landed under the
+`event_date` it happened, and the daily merge starts at the oldest partition the run touched (on Glue: a
+two-day lookback). For the touched customers the job turns their existing versions back into a change log, adds
+the new events, dedupes and rebuilds their chain, so a late change slots in between two versions and the earlier
+one is re-closed. Anything later than the lookback is fixed by the weekly full rebuild.
+
+**4. How is a delete represented in the dimension?**
+`after` is null on a delete, so the key and last values come from `before` (that is why the table has replica
+identity FULL). The delete closes the open version, sets `ended_by_delete = true` and `closed_by_lsn` to the delete's
+LSN, and no current row remains. If the same customer id is created again, a new chain starts after a gap, and
+the `no_gap_without_delete` check accepts that gap because a delete explains it.
+
+**5. Why rebuild history per customer instead of a classic MERGE that closes the current row and inserts a new one?**
+The classic two-step merge assumes events arrive in order and once. With late events it can close the wrong
+version or leave two current rows. Rebuilding the chain for only the touched customers keeps the cost close to an
+incremental merge (untouched customers are copied with a `left_anti` join) and gives exactly the same result as
+a full rebuild, which the tests check on a generated stream with duplicates and late events.
+
+**6. How do you make sure analysts never query a half-written or wrong table?**
+Each run writes a new `v=<run_id>` prefix. Data-quality checks run on that prefix, including a reconciliation
+of current rows against the latest change per customer in bronze. Only on PASS does the job call Glue
+`UpdateTable` to point the table at the new prefix, which Athena picks up for the next query. On FAIL the job
+exits 1, the alert fires, and yesterday's version stays live. Rollback is the same call with the previous version.
+
+**7. What happens if the Debezium connector is down for a few hours?**
+The replication slot keeps the WAL from the last confirmed position, so nothing is lost; when the connector comes
+back it continues from there and the events are late, which the pipeline already handles. The risk is on the
+database side: retained WAL grows, so slot lag needs an alarm. If the slot is ever dropped, the fix is a new
+snapshot (`snapshot.mode`) and a full rebuild from bronze plus the snapshot events, which are `op = r`.
+
+**8. How would this change with Iceberg?**
+The build logic stays the same. Instead of writing a new prefix and swapping the location, the job would
+`MERGE INTO` the affected customers' rows in one Iceberg commit, and rollback would be a snapshot rollback. The
+benefit is that the job no longer copies untouched rows every day; the trade-off is compaction and snapshot
+expiry to schedule.
+
+**9. How is it tested without an AWS account?**
+Spark runs in local mode, S3 and the Glue catalog are mocked with moto, and the generator produces Debezium-style
+envelopes with injected duplicates and late events. The integration tests run two daily cycles and compare the
+result with a full rebuild, retry the same day to prove idempotency, and break the data on purpose to check that
+a failed DQ check keeps the old version live. CI runs all of it on every push, plus `terraform validate`.
+
 ## Tests
 ```bash
 pytest -q                        # everything (local Spark, no AWS)
@@ -352,4 +408,5 @@ tests/          pytest (local Spark, no AWS)
 - [x] Unit + integration tests
 - [x] Terraform
 - [x] GitHub Actions CI
-- [ ] Design decisions, AWS mapping and FAQ
+- [x] Design decisions, AWS mapping and interview notes
+- [ ] Final polish
