@@ -5,7 +5,30 @@
 Change data capture (CDC) from a Postgres core-banking database with **Debezium + Kafka**, landed on S3 and
 merged into an **SCD Type 2** customer dimension with **PySpark**, queryable in **Athena**.
 
-> 🚧 Work in progress – built milestone by milestone. See [Roadmap](#roadmap).
+## Quick start
+```bash
+pip install -r requirements.txt   # Java 11 or 17 on PATH for Spark
+make test                         # unit + integration, no AWS or Docker needed
+make demo                         # two simulated days: land -> SCD2 -> DQ -> promote, then one customer's history
+make help                         # all targets (docker stack, Glue zip, terraform validate)
+```
+`make demo` ends with the history of the customer that changed most, for example:
+```
+live version: v=day2
+day1.json: PASS
+day2.json: PASS
+
+history of customer 25:
++-------------------+-------------------+----------+---------+----------+---------+
+|valid_from         |valid_to           |is_current|risk_tier|kyc_status|source_op|
++-------------------+-------------------+----------+---------+----------+---------+
+|2026-10-01 12:04:33|2026-10-01 12:21:24|false     |HIGH     |PENDING   |c        |
+|2026-10-01 16:16:55|2026-10-01 17:38:07|false     |HIGH     |EXPIRED   |u        |
+|2026-10-01 21:25:22|2026-10-02 03:53:51|false     |LOW      |EXPIRED   |u        |
+|2026-10-02 03:53:51|9999-12-31 23:59:59|true      |LOW      |VERIFIED  |u        |
++-------------------+-------------------+----------+---------+----------+---------+
+```
+(rows trimmed; the full output has every version.)
 
 ## Business scenario
 A retail bank keeps customer master data (KYC status, risk tier, address, branch) in an OLTP Postgres database.
@@ -391,7 +414,8 @@ transforms/     bronze -> SCD2 silver (PySpark)
 quality/        data-quality checks on the dimension
 pipeline/       daily run: land -> build version -> DQ -> promote; Glue job + Glue catalog promote
 glue/           script the Glue job runs
-scripts/        package_glue.sh (code zip for --extra-py-files)
+scripts/        package_glue.sh (code zip for --extra-py-files), demo.sh (two-day local run)
+Makefile        test / demo / docker / glue-zip / terraform shortcuts
 terraform/      S3 + KMS, Glue catalog/job/triggers, IAM, optional MSK, alerts
 tests/          pytest (local Spark, no AWS)
 .github/        CI: tests on Python 3.10/3.11, Glue package check, terraform validate
@@ -409,4 +433,4 @@ tests/          pytest (local Spark, no AWS)
 - [x] Terraform
 - [x] GitHub Actions CI
 - [x] Design decisions, AWS mapping and interview notes
-- [ ] Final polish
+- [x] Final polish (Makefile, one-command demo)
